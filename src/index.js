@@ -17,7 +17,14 @@ export default {
 
     try {
       if (url.pathname === '/' || url.pathname === '/index.html') {
+        const input = url.searchParams.get('u') || '';
+        if (input) return handleMake(input, request, ctx);
         return html(generatorPage(url.origin));
+      }
+
+      if (url.pathname === '/make') {
+        const input = url.searchParams.get('u') || '';
+        return handleMake(input, request, ctx);
       }
 
       if (url.pathname === '/api') {
@@ -29,7 +36,7 @@ export default {
       if (url.pathname === '/oembed') {
         const input = url.searchParams.get('u') || '';
         const meta = await getMetadata(input, request, ctx);
-        const src = `${url.origin}/u/${encodeForPath(meta.originalUrl)}`;
+        const src = `${url.origin}/u/${encodeForPath(meta.canonicalUrl)}`;
         return json({
           version: '1.0',
           type: 'rich',
@@ -40,7 +47,7 @@ export default {
           thumbnail_url: meta.image,
           width: 430,
           height: 650,
-          html: `<iframe src="${escapeAttr(src)}" width="430" height="650" style="border:0;max-width:100%;border-radius:24px;overflow:hidden;" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="clipboard-write" title="Instagram preview"></iframe>`
+          html: iframeCode(src)
         }, 200, 3600);
       }
 
@@ -51,30 +58,35 @@ export default {
         return html(embedPage(meta, url.toString(), url.origin), 200, 3600);
       }
 
-      if (url.pathname === '/e') {
-        const input = url.searchParams.get('u') || '';
-        const meta = await getMetadata(input, request, ctx);
-        const self = `${url.origin}/u/${encodeForPath(meta.originalUrl)}`;
-        return html(embedPage(meta, self, url.origin), 200, 3600);
-      }
-
       if (url.pathname === '/healthz') return new Response('ok');
 
       if (env.ASSETS) return env.ASSETS.fetch(request);
       return new Response('Not found', { status: 404 });
     } catch (err) {
       const status = err.status || 500;
-      const message = err.publicMessage || err.message || 'Unknown error';
-      if (url.pathname === '/api' || url.pathname === '/oembed') {
-        return json({ ok: false, error: message }, status, 0);
-      }
-      return html(errorPage(message), status, 0);
+      const message = err.publicMessage || err.message || 'Ошибка';
+      return html(generatorPage(url.origin, { input: url.searchParams.get('u') || '', error: message }), status, 0);
     }
   }
 };
 
+async function handleMake(input, request, ctx) {
+  try {
+    const url = new URL(request.url);
+    const meta = await getMetadata(input, request, ctx);
+    const share = `${url.origin}/u/${encodeForPath(meta.canonicalUrl)}`;
+    const iframe = iframeCode(share);
+    return html(generatorPage(url.origin, { input, meta, share, iframe, message: 'Готово.' }), 200, 0);
+  } catch (err) {
+    const url = new URL(request.url);
+    const message = err.publicMessage || err.message || 'Ошибка';
+    return html(generatorPage(url.origin, { input, error: message }), err.status || 400, 0);
+  }
+}
+
 async function getMetadata(input, request, ctx) {
   const info = normalizeInstagramUrl(input);
+
   const cacheUrl = new URL(request.url);
   cacheUrl.pathname = '/__meta_cache__';
   cacheUrl.search = `?u=${encodeURIComponent(info.canonicalUrl)}`;
@@ -82,9 +94,7 @@ async function getMetadata(input, request, ctx) {
   const cache = caches.default;
 
   const cached = await cache.match(cacheKey);
-  if (cached) {
-    return await cached.json();
-  }
+  if (cached) return cached.json();
 
   let og = {};
   let fetchError = '';
@@ -94,12 +104,10 @@ async function getMetadata(input, request, ctx) {
     fetchError = String(e && e.message ? e.message : e);
   }
 
-  const fallbackTitle = titleByType(info.type);
-  const rawTitle = cleanText(og.title || fallbackTitle);
-  const rawDescription = cleanText(og.description || 'Локальная embed-страница с переходом на оригинал в Instagram.');
-  const author = parseAuthor(rawTitle, rawDescription) || 'Instagram';
-
   const origin = new URL(request.url).origin;
+  const rawTitle = cleanText(og.title || titleByType(info.type));
+  const rawDescription = cleanText(og.description || 'Preview для Instagram-ссылки.');
+  const author = parseAuthor(rawTitle, rawDescription) || info.username || 'Instagram';
   const image = absoluteImage(og.image, info.canonicalUrl) || `${origin}/fallback.jpg`;
 
   const meta = {
@@ -112,7 +120,6 @@ async function getMetadata(input, request, ctx) {
     author,
     title: rawTitle,
     description: rawDescription,
-    caption: rawDescription,
     image,
     fetched: Boolean(og.title || og.description || og.image),
     fetchError
@@ -134,16 +141,15 @@ async function fetchOpenGraph(targetUrl) {
     cf: { cacheTtl: 3600, cacheEverything: true }
   });
 
-  if (!res.ok) throw new Error(`Instagram returned HTTP ${res.status}`);
-
-  const body = await res.text();
-  return parseMeta(body);
+  if (!res.ok) throw new Error(`Instagram HTTP ${res.status}`);
+  return parseMeta(await res.text());
 }
 
 function parseMeta(htmlText) {
   const out = {};
   const metaRe = /<meta\s+([^>]*?)>/gi;
   let m;
+
   while ((m = metaRe.exec(htmlText))) {
     const attrs = parseAttrs(m[1]);
     const key = (attrs.property || attrs.name || '').toLowerCase();
@@ -163,87 +169,61 @@ function parseAttrs(raw) {
   const attrs = {};
   const re = /([a-zA-Z_:.-]+)\s*=\s*("[^"]*"|'[^']*'|[^\s"'>]+)/g;
   let m;
+
   while ((m = re.exec(raw))) {
     const key = m[1].toLowerCase();
     let val = m[2] || '';
-    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-      val = val.slice(1, -1);
-    }
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
     attrs[key] = val;
   }
+
   return attrs;
 }
 
 function normalizeInstagramUrl(input) {
-  if (!input || !String(input).trim()) {
-    throw Object.assign(new Error('Вставь ссылку на Instagram/Reels.'), { status: 400, publicMessage: 'Вставь ссылку на Instagram/Reels.' });
-  }
+  if (!input || !String(input).trim()) throw publicError('Вставь ссылку.', 400);
 
   let u;
   try {
     u = new URL(String(input).trim());
   } catch {
-    throw Object.assign(new Error('Некорректная ссылка.'), { status: 400, publicMessage: 'Некорректная ссылка.' });
+    throw publicError('Некорректная ссылка.', 400);
   }
 
-  if (!['http:', 'https:'].includes(u.protocol)) {
-    throw Object.assign(new Error('Поддерживаются только http/https ссылки.'), { status: 400, publicMessage: 'Поддерживаются только http/https ссылки.' });
-  }
+  if (!['http:', 'https:'].includes(u.protocol)) throw publicError('Нужна http/https ссылка.', 400);
 
   const host = u.hostname.toLowerCase();
-  if (!ALLOWED_HOSTS.has(host)) {
-    throw Object.assign(new Error('Поддерживаются только instagram.com и kkinstagram.com.'), { status: 400, publicMessage: 'Поддерживаются только instagram.com и kkinstagram.com.' });
+  if (!ALLOWED_HOSTS.has(host)) throw publicError('Поддерживаются только instagram.com и kkinstagram.com.', 400);
+
+  const parts = u.pathname.split('/').filter(Boolean);
+  let type = '';
+  let shortcode = '';
+  let username = '';
+
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i].toLowerCase();
+    if ((p === 'p' || p === 'reel' || p === 'tv') && parts[i + 1]) {
+      type = p;
+      shortcode = parts[i + 1];
+      if (i > 0) username = parts[i - 1];
+      break;
+    }
   }
 
-  const match = u.pathname.match(/^\/(reel|p|tv)\/([A-Za-z0-9_-]+)/i);
-  if (!match) {
-    throw Object.assign(new Error('Не нашёл shortcode. Нужна ссылка вида /reel/код/, /p/код/ или /tv/код/.'), { status: 400, publicMessage: 'Не нашёл shortcode. Нужна ссылка вида /reel/код/, /p/код/ или /tv/код/.' });
+  if (!type || !/^[A-Za-z0-9_-]{5,}$/.test(shortcode)) {
+    throw publicError('Не найден код публикации.', 400);
   }
 
-  const type = match[1].toLowerCase();
-  const shortcode = match[2];
   const canonicalUrl = `https://www.instagram.com/${type}/${shortcode}/`;
-  return {
-    originalUrl: canonicalUrl,
-    canonicalUrl,
-    type,
-    shortcode
-  };
-}
-
-function titleByType(type) {
-  if (type === 'reel') return 'Instagram Reel';
-  if (type === 'tv') return 'Instagram Video';
-  return 'Instagram Post';
-}
-
-function parseAuthor(title, description) {
-  const sources = [title, description].filter(Boolean);
-  for (const s of sources) {
-    let m = s.match(/^([^:•|]{2,80})\s+(?:on|в)\s+Instagram/i);
-    if (m) return cleanText(m[1]);
-    m = s.match(/@([A-Za-z0-9_.]{2,30})/);
-    if (m) return '@' + m[1];
-  }
-  return '';
-}
-
-function absoluteImage(src, base) {
-  if (!src) return '';
-  try {
-    return new URL(src, base).toString();
-  } catch {
-    return '';
-  }
+  return { originalUrl: String(input).trim(), canonicalUrl, type, shortcode, username };
 }
 
 function embedPage(meta, selfUrl, origin) {
   const image = meta.image || `${origin}/fallback.jpg`;
   const title = meta.title || titleByType(meta.type);
-  const description = meta.description || 'Локальная embed-страница с переходом на оригинал в Instagram.';
+  const description = meta.description || 'Preview для Instagram-ссылки.';
   const author = meta.author || 'Instagram';
   const badge = meta.type === 'reel' ? 'Instagram Reel' : (meta.type === 'tv' ? 'Instagram Video' : 'Instagram Post');
-  const fetchedLine = meta.fetched ? 'Метаданные подхвачены автоматически' : 'Meta не отдала метаданные — показан fallback';
 
   return `<!doctype html>
 <html lang="ru">
@@ -252,7 +232,6 @@ function embedPage(meta, selfUrl, origin) {
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>${escapeHtml(title)}</title>
   <meta name="description" content="${escapeAttr(description)}">
-
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="${escapeAttr(APP_NAME)}">
   <meta property="og:url" content="${escapeAttr(selfUrl)}">
@@ -261,12 +240,10 @@ function embedPage(meta, selfUrl, origin) {
   <meta property="og:image" content="${escapeAttr(image)}">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
-
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeAttr(title)}">
   <meta name="twitter:description" content="${escapeAttr(description)}">
   <meta name="twitter:image" content="${escapeAttr(image)}">
-
   <style>${pageCss()}</style>
 </head>
 <body>
@@ -281,7 +258,6 @@ function embedPage(meta, selfUrl, origin) {
         <div class="overline">${escapeHtml(badge)} · ${escapeHtml(author)}</div>
         <h1>${escapeHtml(title)}</h1>
         <p>${escapeHtml(description)}</p>
-        <div class="status">${escapeHtml(fetchedLine)}</div>
         <a class="btn" href="${escapeAttr(meta.openUrl)}" target="_blank" rel="noopener noreferrer">Открыть в Instagram</a>
       </section>
     </article>
@@ -290,95 +266,115 @@ function embedPage(meta, selfUrl, origin) {
 </html>`;
 }
 
-function generatorPage(origin) {
+function generatorPage(origin, state = {}) {
+  const input = state.input || '';
+  const meta = state.meta || null;
+  const share = state.share || '';
+  const iframe = state.iframe || '';
+  const message = state.error || state.message || '';
+  const preview = meta ? previewCard(meta) : '<div class="empty">Превью появится здесь.</div>';
+
   return `<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <title>Instagram/Reels Embed Generator</title>
-  <meta name="description" content="Генератор ссылок с Open Graph preview для Instagram/Reels.">
+  <meta name="description" content="Генератор embed-ссылок для Instagram/Reels.">
   <style>${pageCss()}${generatorCss()}</style>
 </head>
 <body>
   <main class="shell">
     <section class="panel">
       <h1>Instagram/Reels Embed Generator</h1>
-      <p class="lead">Вставь ссылку на Reel/Post — получишь ссылку, которая сама отдаёт Open Graph preview для Telegram, VK и Discord.</p>
+      <p class="lead">Вставь ссылку на Reel/Post — получишь embed-ссылку и iframe-код.</p>
 
-      <label>Ссылка Instagram / kkinstagram</label>
-      <input id="src" value="https://www.instagram.com/reel/DYikItvvxgP/" inputmode="url" autocomplete="off">
+      <form method="get" action="/make" autocomplete="off">
+        <label for="src">Ссылка Instagram / kkinstagram</label>
+        <input id="src" name="u" value="${escapeAttr(input)}" inputmode="url" placeholder="https://www.instagram.com/reel/.../">
+        <button class="primary" type="submit">Сделать ссылку</button>
+        ${message ? `<div class="msg">${escapeHtml(message)}</div>` : ''}
+      </form>
 
-      <button id="make">Сделать ссылку</button>
-      <span id="msg"></span>
+      <label for="share">Embed-ссылка</label>
+      <textarea id="share" readonly>${escapeHtml(share)}</textarea>
+      <button type="button" data-copy="share">Скопировать ссылку</button>
 
-      <label>Ссылка для Telegram / VK / Discord</label>
-      <textarea id="share" readonly></textarea>
-      <button data-copy="share">Скопировать ссылку</button>
-
-      <label>iframe-код для сайта</label>
-      <textarea id="iframe" readonly></textarea>
-      <button data-copy="iframe">Скопировать iframe</button>
+      <label for="iframe">iframe-код</label>
+      <textarea id="iframe" readonly>${escapeHtml(iframe)}</textarea>
+      <button type="button" data-copy="iframe">Скопировать iframe</button>
     </section>
 
-    <section class="preview" id="preview">
-      <div class="empty">Тут появится живое превью.</div>
-    </section>
+    <section class="preview">${preview}</section>
   </main>
 
-<script>
-const $ = (id) => document.getElementById(id);
-function b64urlEncode(str) {
-  const bytes = new TextEncoder().encode(str);
-  let bin = '';
-  bytes.forEach(b => bin += String.fromCharCode(b));
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-function esc(s) { return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-async function make() {
-  const raw = $('src').value.trim();
-  $('msg').textContent = 'Загружаю метаданные...';
-  const enc = b64urlEncode(raw);
-  const share = location.origin + '/u/' + enc;
-  $('share').value = share;
-  $('iframe').value = '<iframe src="' + share + '" width="430" height="650" style="border:0;max-width:100%;border-radius:24px;overflow:hidden;" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="clipboard-write" title="Instagram preview"></iframe>';
-
-  const res = await fetch('/api?u=' + encodeURIComponent(raw));
-  const data = await res.json();
-  if (!res.ok || !data.ok) throw new Error(data.error || 'Ошибка');
-
-  $('preview').innerHTML = '<article class="card mini">'
-    + '<a class="cover" href="' + esc(data.openUrl) + '" target="_blank" rel="noopener noreferrer">'
-    + '<img src="' + esc(data.image) + '" alt="' + esc(data.title) + '"><span class="pill">Instagram</span><span class="play">▶</span></a>'
-    + '<section class="body"><div class="overline">' + esc(data.type) + ' · ' + esc(data.author) + '</div>'
-    + '<h1>' + esc(data.title) + '</h1><p>' + esc(data.description) + '</p>'
-    + '<div class="status">' + (data.fetched ? 'Метаданные подхвачены автоматически' : 'Meta не отдала метаданные — fallback') + '</div>'
-    + '<a class="btn" href="' + esc(data.openUrl) + '" target="_blank" rel="noopener noreferrer">Открыть в Instagram</a></section></article>';
-  $('msg').textContent = data.fetched ? 'Готово: автор/заголовок/обложка подхвачены.' : 'Готово, но Instagram не отдал метаданные — будет fallback.';
-}
-$('make').addEventListener('click', () => make().catch(e => { $('msg').textContent = e.message; }));
-document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('click', async () => {
-  const id = btn.getAttribute('data-copy');
-  await navigator.clipboard.writeText($(id).value);
-  btn.textContent = 'Скопировано';
-  setTimeout(() => btn.textContent = id === 'share' ? 'Скопировать ссылку' : 'Скопировать iframe', 1200);
-}));
-make().catch(() => {});
-</script>
+  <script>
+    document.querySelectorAll('[data-copy]').forEach(function(btn){
+      btn.addEventListener('click', async function(){
+        var el = document.getElementById(btn.getAttribute('data-copy'));
+        if (!el || !el.value) return;
+        try {
+          await navigator.clipboard.writeText(el.value);
+          var old = btn.textContent;
+          btn.textContent = 'Скопировано';
+          setTimeout(function(){ btn.textContent = old; }, 1200);
+        } catch (e) {
+          el.focus();
+          el.select();
+          document.execCommand('copy');
+        }
+      });
+    });
+  </script>
 </body>
 </html>`;
 }
 
-function errorPage(message) {
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ошибка</title><style>${pageCss()}</style></head><body><main class="wrap"><article class="card"><section class="body"><h1>Не удалось сделать preview</h1><p>${escapeHtml(message)}</p><a class="btn" href="/">Назад</a></section></article></main></body></html>`;
+function previewCard(data) {
+  const image = data.image || '/fallback.jpg';
+  const title = data.title || titleByType(data.type);
+  const description = data.description || '';
+  return `<article class="card mini">
+    <a class="cover" href="${escapeAttr(data.openUrl)}" target="_blank" rel="noopener noreferrer">
+      <img src="${escapeAttr(image)}" alt="${escapeAttr(title)}">
+      <span class="pill">Instagram</span>
+      <span class="play">▶</span>
+    </a>
+    <section class="body">
+      <div class="overline">${escapeHtml(data.author || 'Instagram')}</div>
+      <h1>${escapeHtml(title)}</h1>
+      <p>${escapeHtml(description)}</p>
+      <a class="btn" href="${escapeAttr(data.openUrl)}" target="_blank" rel="noopener noreferrer">Открыть в Instagram</a>
+    </section>
+  </article>`;
 }
 
 function pageCss() {
-  return `:root{color-scheme:dark;--bg:#0f0f13;--card:#18181e;--line:#34343d;--text:#f4f4f7;--muted:#b9b9c7;--pink:#ff0f7b;--orange:#ff6b35;--violet:#6b20ff}*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;background:radial-gradient(circle at 10% 0%,#25202d 0,#0f0f13 38%,#08080b 100%);color:var(--text)}.wrap{min-height:100svh;display:grid;place-items:center;padding:22px}.card{width:min(430px,100%);background:var(--card);border:1px solid var(--line);border-radius:28px;overflow:hidden;box-shadow:0 30px 90px #0008}.cover{display:block;position:relative;aspect-ratio:1/1.12;background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet));overflow:hidden}.cover img{width:100%;height:100%;object-fit:cover;display:block}.pill{position:absolute;left:18px;top:18px;background:#0009;color:white;font-weight:800;border-radius:99px;padding:8px 12px;font-size:13px}.play{position:absolute;right:18px;bottom:18px;width:54px;height:54px;border-radius:999px;background:#140a3ccc;display:grid;place-items:center;font-size:22px}.body{padding:20px}.overline{text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-size:12px;font-weight:900}.body h1{margin:8px 0 10px;font-size:24px;line-height:1.1}.body p{margin:0 0 16px;color:var(--muted);line-height:1.45}.status{font-size:12px;color:#a7a7b5;margin:0 0 18px}.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:white;background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet));font-weight:900;border-radius:14px;padding:12px 16px}`;
+  return `:root{color-scheme:dark;--bg:#0f0f13;--card:#18181e;--line:#34343d;--text:#f4f4f7;--muted:#b9b9c7;--pink:#ff0f7b;--orange:#ff6b35;--violet:#6b20ff}*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,Arial,sans-serif;background:radial-gradient(circle at 10% 0%,#25202d 0,#0f0f13 38%,#08080b 100%);color:var(--text)}.wrap{min-height:100svh;display:grid;place-items:center;padding:22px}.card{width:min(430px,100%);background:var(--card);border:1px solid var(--line);border-radius:28px;overflow:hidden;box-shadow:0 30px 90px #0008}.cover{display:block;position:relative;aspect-ratio:1/1.12;background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet));overflow:hidden}.cover img{width:100%;height:100%;object-fit:cover;display:block}.pill{position:absolute;left:18px;top:18px;background:#0009;color:white;font-weight:800;border-radius:99px;padding:8px 12px;font-size:13px}.play{position:absolute;right:18px;bottom:18px;width:54px;height:54px;border-radius:999px;background:#140a3ccc;display:grid;place-items:center;font-size:22px}.body{padding:20px}.overline{text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-size:12px;font-weight:900}.body h1{margin:8px 0 10px;font-size:24px;line-height:1.1}.body p{margin:0 0 16px;color:var(--muted);line-height:1.45}.btn{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;color:white;background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet));font-weight:900;border-radius:14px;padding:12px 16px}`;
 }
 
 function generatorCss() {
-  return `.shell{width:min(1100px,100%);margin:0 auto;padding:38px 18px;display:grid;grid-template-columns:1fr 440px;gap:22px}.panel{background:#18181ecc;border:1px solid var(--line);border-radius:28px;padding:22px}.panel h1{font-size:42px;line-height:1;margin:0 0 10px}.lead{color:var(--muted);line-height:1.5;margin:0 0 24px}label{display:block;margin:16px 0 8px;font-weight:800}input,textarea{width:100%;border:1px solid var(--line);background:#101015;color:var(--text);border-radius:16px;padding:14px;font:inherit}textarea{min-height:70px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}button{appearance:none;border:0;border-radius:999px;padding:12px 16px;background:#2a2a33;color:white;font-weight:900;margin:12px 8px 0 0}#make{background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet))}#msg{color:var(--muted);font-size:13px}.preview{display:grid;place-items:start}.mini{width:100%}.empty{width:100%;border:1px dashed var(--line);border-radius:28px;padding:40px;color:var(--muted);text-align:center}@media(max-width:900px){.shell{grid-template-columns:1fr}.panel h1{font-size:32px}}`;
+  return `.shell{width:min(1100px,100%);margin:0 auto;padding:38px 18px;display:grid;grid-template-columns:1fr 440px;gap:22px}.panel{background:#18181ecc;border:1px solid var(--line);border-radius:28px;padding:22px}.panel h1{font-size:42px;line-height:1;margin:0 0 10px}.lead{color:var(--muted);line-height:1.5;margin:0 0 24px}label{display:block;margin:16px 0 8px;font-weight:800}input,textarea{width:100%;border:1px solid var(--line);background:#101015;color:var(--text);border-radius:16px;padding:14px;font:inherit}textarea{min-height:70px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}button{appearance:none;border:0;border-radius:999px;padding:12px 16px;background:#2a2a33;color:white;font-weight:900;margin:12px 8px 0 0;cursor:pointer}.primary{background:linear-gradient(135deg,var(--orange),var(--pink),var(--violet));box-shadow:0 0 0 2px #fff}.msg{color:var(--muted);font-size:13px;margin-top:10px}.preview{display:grid;place-items:start}.mini{width:100%}.empty{width:100%;border:1px dashed var(--line);border-radius:28px;padding:40px;color:var(--muted);text-align:center}@media(max-width:900px){.shell{grid-template-columns:1fr}.panel h1{font-size:32px}}`;
+}
+
+function titleByType(type) {
+  if (type === 'reel') return 'Instagram Reel';
+  if (type === 'tv') return 'Instagram Video';
+  return 'Instagram Post';
+}
+
+function parseAuthor(title, description) {
+  for (const s of [title, description].filter(Boolean)) {
+    let m = s.match(/^([^:•|]{2,80})\s+(?:on|в)\s+Instagram/i);
+    if (m) return cleanText(m[1]);
+    m = s.match(/@([A-Za-z0-9_.]{2,30})/);
+    if (m) return '@' + m[1];
+  }
+  return '';
+}
+
+function iframeCode(src) {
+  return `<iframe src="${escapeAttr(src)}" width="430" height="650" style="border:0;max-width:100%;border-radius:24px;overflow:hidden;" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="clipboard-write" title="Instagram preview"></iframe>`;
 }
 
 function encodeForPath(str) {
@@ -397,20 +393,20 @@ function decodeFromPath(s) {
   return new TextDecoder().decode(bytes);
 }
 
+function absoluteImage(src, base) {
+  if (!src) return '';
+  try { return new URL(src, base).toString(); } catch { return ''; }
+}
+
 function cleanText(s) {
   return decodeEntities(String(s || '')).replace(/\s+/g, ' ').trim();
 }
 
 function decodeEntities(s) {
   return String(s || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
-    .replace(/&#x2F;/g, '/')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
 }
 
@@ -420,6 +416,10 @@ function escapeHtml(s) {
 
 function escapeAttr(s) {
   return String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function publicError(message, status = 400) {
+  return Object.assign(new Error(message), { status, publicMessage: message });
 }
 
 function html(body, status = 200, maxAge = 0) {
